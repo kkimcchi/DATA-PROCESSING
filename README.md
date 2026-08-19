@@ -35,6 +35,7 @@ DROP_COLS = ["instant", "casual", "registered"]  # 식별자 + 데이터 누수 
 data/
   raw/day.csv                # 원본 데이터 (예시 데이터셋 — 교체 가능)
   processed/day_preprocessed.csv
+  processed/day_anomalies.csv # IsolationForest 이상치 탐지 결과 (37행)
 src/
   preprocessing.py           # STEP 0~9: 결측치/이상치 처리
   regression.py               # STEP 6, 10~11: OLS 선형회귀 + 설계행렬 생성(build_design_matrix)
@@ -44,10 +45,12 @@ src/
   tune_linear.py              # Ridge/Lasso 하이퍼파라미터 튜닝
   tune_random_forest.py      # Random Forest 하이퍼파라미터 튜닝
   tune_xgboost.py             # XGBoost 하이퍼파라미터 튜닝
+  anomaly_detection.py        # IsolationForest 이상치 탐지 + counterfactual 원인 분석 (보조 EDA)
+  plot_anomalies.py           # 이상치 탐지 결과 PNG 시각화 (원인 빈도, 변수별 시계열)
 docs/
   methodology.md              # STEP 0~13 방법론 상세 설명 + 다른 데이터셋 적용 가이드
   claude_code_workflow.md    # Claude Code를 분석 파트너로 활용한 작업 기록
-figures/                      # EDA 시각화 결과
+figures/                      # EDA 시각화 결과 (이상치 탐지 결과 포함)
 requirements.txt
 ```
 
@@ -125,6 +128,91 @@ python tune_xgboost.py         # XGBoost 튜닝
 > 드러납니다. 정규화 선형모델(Ridge/Lasso)로 "선형회귀만 튜닝을 안 해서 불공정한 것 아니냐"는
 > 우려도 검증했으며, 결과는 OLS와 거의 동일했습니다. 하이퍼파라미터 그리드서치를 거친 XGBoost가
 > 최종적으로 가장 우수한 일반화 성능(R²=0.727)을 보였습니다.
+
+## 이상치 탐지 (Isolation Forest)
+
+위 회귀 파이프라인과는 별도로, `day.csv`에서 "평소와 다른 날"을 찾는 보조 EDA를
+`src/anomaly_detection.py`에 구현했습니다. 결측치/이상치를 **보정**하는
+`preprocessing.py`와 달리, 이 스크립트는 데이터를 **수정하지 않고 탐지·설명만** 합니다.
+
+### 방법
+
+1. **탐지** — 기온(`temp`)·체감기온(`atemp`)·습도(`hum`)·풍속(`windspeed`)·
+   날씨등급(`weathersit`)·대여수(`cnt`) 6개 특성으로 `IsolationForest`
+   (`n_estimators=300, contamination=0.05, random_state=42`)를 적합해 전체의
+   상위 5%를 이상치로 판정
+2. **원인 판정(counterfactual 민감도 분석)** — z-score만으로는 "모델이 실제로 그
+   변수 때문에 이상치라고 판단했는지" 확정할 수 없으므로, 이상치로 판정된 각 날짜에서
+   변수 하나씩을 전체 데이터의 **중앙값으로 치환**한 뒤 이상 점수를 다시 계산합니다.
+   점수가 가장 크게 정상화(상승)되는 변수를 그 날의 **"가장 직접적인 원인"**으로 채택합니다.
+
+### 결과 (day.csv 기준)
+
+731일 중 **37일(5.1%)**이 이상치로 탐지되었고, 원인 변수 빈도는 다음과 같습니다.
+
+| 원인 변수 | 일수 | 비율 |
+|---|---|---|
+| 날씨등급(`weathersit`) | 21일 | 56.8% |
+| 풍속(`windspeed`) | 8일 | 21.6% |
+| 체감기온(`atemp`) | 6일 | 16.2% |
+| 습도(`hum`) | 1일 | 2.7% |
+| 대여수(`cnt`) | 1일 | 2.7% |
+
+`weathersit`이 1~4단계로만 표현되는 저해상도 범주형 변수라 값이 조금만 튀어도 편차가
+크게 잡히기 때문에 압도적 1위를 차지합니다. 가장 이상 점수가 낮은(=가장 이상한) 상위
+5일을 실제 워싱턴 D.C. 기상 기록과 대조한 결과, 4건은 실제 기상 이벤트(2011-01-26
+노이스터 폭설, 2011-10-29 "Snowtober" 이례적 초가을 폭설, 2012-12-26 시즌 최대
+적설, 2011-02-19 최대순간풍속 53mph 강풍)로 설명되었고, 나머지 1건(2011-03-10,
+`hum=0`)은 실제 기상 이벤트 기록이 없어 `preprocessing.py`에서 이미 보정한 **센서
+결측 오류**로 재확인되었습니다.
+
+### 시각화
+
+| 원인 변수별 빈도 | 변수별 2년 시계열 + 이상치 강조 |
+|---|---|
+| ![원인 변수별 빈도](figures/anomaly_cause_frequency.png) | ![변수별 시계열](figures/anomaly_variable_timeseries.png) |
+
+### 실행
+
+```bash
+cd src
+python anomaly_detection.py    # data/processed/day_anomalies.csv 생성
+python plot_anomalies.py       # figures/anomaly_cause_frequency.png, anomaly_variable_timeseries.png 생성
+```
+
+## 기각된 실험: holiday_buffer 변수
+
+**결론: 채택하지 않음 — 코드에는 반영되지 않은 실험 기록입니다.**
+
+튜닝 XGBoost(최고 성능 모델)로 731일 전체를 예측해 잔차가 가장 큰 10일을 확인한 결과,
+그중 다수가 허리케인 샌디(2012-10-29~30, 전후 급변일 포함)와 공휴일 관련일(추수감사절
+2012-11-22 및 그 다음 일요일 2012-11-25, 콜럼버스데이 2012-10-08)에 몰려 있었습니다.
+기존 `holiday` 변수는 공휴일 당일만 표시하므로, "공휴일은 아니지만 연휴 분위기가 이어지는
+날"을 포착하지 못한다는 가설로 아래 변수를 추가 실험했습니다.
+
+```python
+holiday_buffer = 1  if 가장 가까운 공휴일까지 거리(일) in [1, 3]  else 0
+# 731일 중 126일이 해당
+```
+
+같은 하이퍼파라미터(`max_depth=2, learning_rate=0.1, subsample=0.8, colsample_bytree=0.8,
+n_estimators=300`)로 28개 변수(기존 27개 + `holiday_buffer`)로 재학습한 결과:
+
+| | 기존 (27개 변수) | + holiday_buffer (28개 변수) |
+|---|---|---|
+| 테스트 R² | **0.727** | 0.711 (악화) |
+| 테스트 RMSE | **980.8** | 1010.2 |
+| 테스트 MAE | **804.6** | 837.8 |
+
+- 의도한 케이스(2012-11-25, 추수감사절 다음 일요일)의 오차는 1796→1592로 확실히
+  줄었지만, 특성 중요도는 28개 중 13위로 낮았고, 애초에 holiday와 무관한 원인(허리케인
+  샌디 등 기상 재해)으로 틀린 날에는 당연히 효과가 없었습니다.
+- 저신호 변수 하나가 추가되면서 얕은 트리(`max_depth=2`) 앙상블의 분기 선택이 흔들려
+  전체 테스트 성능이 오히려 하락했습니다 — 소수 사례의 이득보다 노이즈 비용이 컸던
+  것으로 판단됩니다.
+- **판정**: 목표했던 1일은 개선했지만 전체 지표를 악화시켰으므로 기각. 재해/이상기상
+  플래그처럼 나머지 오차(샌디 관련 4일 등)를 함께 겨냥하는 변수와 결합하거나, 더 깊은
+  트리에서 재검증해볼 여지는 있습니다.
 
 ## 이 프로젝트의 접근 방식
 
